@@ -420,6 +420,9 @@ def install_unit():
 
 def main(argv):
     cmd = argv[0] if argv else ""
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
     if cmd == "enqueue":
         return enqueue(argv[1:])
     if cmd == "install-unit":

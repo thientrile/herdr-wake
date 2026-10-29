@@ -502,6 +502,14 @@ class Worker(Base):
             self.assertEqual(self.W.status(), 0)
 
 
+class Help(Base):
+    def test_help_exits_0_and_unknown_command_exits_2(self):
+        r = subprocess.run([sys.executable, "-I", WAKE, "--help"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("wake enqueue --source", r.stdout)
+        self.assertEqual(subprocess.run([sys.executable, "-I", WAKE, "bogus"], env=self.env, capture_output=True).returncode, 2)
+
+
 class InstallUnit(Base):
     def test_unit_text_and_install(self):
         cfg = os.path.join(self.tmp.name, "xdgconfig")

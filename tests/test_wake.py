@@ -483,7 +483,7 @@ Description=herdr-wake delivery worker (wakes herdr agent panes from the wake qu
 ExecStart={python} -I {os.path.realpath(WAKE)} worker
 Environment="HERDR_BIN_PATH={os.path.realpath(os.path.join(self.bindir, "herdr"))}"
 Environment="XDG_STATE_HOME={self.state_home}"
-Environment="PATH={self.env["PATH"]}"
+Environment="PATH={os.path.expanduser("~/.local/bin")}:{self.bindir}:/usr/local/bin:/usr/bin:/bin"
 Restart=always
 RestartSec=5
 

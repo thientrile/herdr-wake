@@ -376,7 +376,8 @@ def status():
 
 def unit_text(script, herdr_bin):
     # pin the producers' state dir and PATH (notify_cmd lives there): the systemd user manager has neither
-    env = {"HERDR_BIN_PATH": herdr_bin, "XDG_STATE_HOME": os.path.dirname(STATE), "PATH": os.environ.get("PATH", "")}
+    path = [os.path.expanduser("~/.local/bin"), os.path.dirname(herdr_bin), "/usr/local/bin", "/usr/bin", "/bin"]
+    env = {"HERDR_BIN_PATH": herdr_bin, "XDG_STATE_HOME": os.path.dirname(STATE), "PATH": ":".join(dict.fromkeys(path))}
     env_lines = "".join(f'Environment="{k}={v.replace("%", "%%")}"\n' for k, v in env.items())
     return f"""[Unit]
 Description=herdr-wake delivery worker (wakes herdr agent panes from the wake queue)

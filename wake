@@ -325,7 +325,8 @@ def run_once(now=None):
                     retry(rec, now, f"agent {panes_by_id[pane_id].get('agent_status')}")
                     write("pending", rec)
             continue
-        batch = sorted(batch, key=lambda r: r["created_at"])[:MAX_BATCH]  # the rest go in the next pass
+        # due events first so each bounded batch carries one; the rest go in a later pass
+        batch = sorted(sorted(batch, key=lambda r: (r["next_at"] > now, r["created_at"]))[:MAX_BATCH], key=lambda r: r["created_at"])
         batch_id = secrets.token_hex(6)
         with queue_lock():
             for rec in batch:

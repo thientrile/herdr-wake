@@ -281,6 +281,21 @@ class Delivery(Base):
         self.assertEqual([p["args"][3].count("\n- [") for p in self.prompts()], [50, 10])
         self.assertEqual(self.counts()["delivered"], 60)
 
+    def test_bounded_batch_always_carries_the_due_event(self):
+        t0 = time.time()
+        for i in range(50):
+            self.enqueue(f"old{i}")
+        self.mode("fail")
+        self.run_pass(t0)  # all 50 now in backoff
+        self.mode("ok")
+        self.enqueue("new")
+        self.run_pass(t0 + 1)
+        self.assertIn("gh-watch:new", [r["key"] for r in self.W.records("delivered")])
+        for dt in (2, 3, 4):  # the one old event left over stays in backoff: no prompt
+            self.run_pass(t0 + dt)
+        self.assertEqual(len(self.prompts()), 2)
+        self.assertEqual(self.counts()["pending"], 1)
+
     def test_busy_over_600s_delivered_after_idle(self):
         t0 = time.time()
         self.enqueue("d1")

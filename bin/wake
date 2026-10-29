@@ -1,0 +1,9 @@
+#!/bin/sh
+# wake shim (herdr-wake plugin): looks up the current install on every run, so plugin updates need no reinstall.
+# fallback is the plugin root at install time: enqueue must still store events while the herdr server is down.
+fallback=
+root=$("${HERDR_BIN_PATH:-herdr}" plugin list --json --plugin thientrile.wake 2>/dev/null |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["result"]["plugins"][0]["plugin_root"])' 2>/dev/null)
+[ -f "$root/wake" ] || root=$fallback
+[ -f "$root/wake" ] || { echo "wake: plugin thientrile.wake is not installed in herdr" >&2; exit 127; }
+exec python3 -I "$root/wake" "$@"

@@ -178,6 +178,25 @@ class Enqueue(Base):
         # same id from another source is a different key
         self.assertEqual(json.loads(self.enqueue("d1", source="hjob")[1])["status"], "enqueued")
 
+    def test_duplicate_after_failed_dir_sync_syncs_before_ack(self):
+        real, synced, fail = self.W.fsync_dir, [], [True]
+
+        def flaky(d):
+            synced.append(d)
+            if fail[0]:
+                fail[0] = False
+                raise OSError("EIO")
+            real(d)
+
+        self.W.fsync_dir = flaky
+        self.assertEqual(self.enqueue("d1")[0], 1)  # renamed into pending/, but its dir sync failed
+        synced.clear()
+        code, out, _ = self.enqueue("d1")
+        self.assertEqual((code, json.loads(out)["status"]), (0, "duplicate"))
+        self.assertIn(os.path.join(self.W.STATE, "pending"), synced)
+        fail[0] = True  # a retry whose sync fails again is not acknowledged
+        self.assertEqual(self.enqueue("d1")[0], 1)
+
     def test_killed_enqueue_leaves_no_record(self):
         # crash after the temp file is written, before os.replace
         code = subprocess.run([sys.executable, "-I", "-c",

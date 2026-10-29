@@ -140,7 +140,9 @@ def enqueue(argv):
     try:
         setup()
         with queue_lock():
-            if any(os.path.exists(os.path.join(STATE, s, name(key))) for s in STATES):
+            found = [s for s in STATES if os.path.exists(os.path.join(STATE, s, name(key)))]
+            if found:  # an earlier enqueue may have failed after its rename: commit that entry before acking
+                fsync_dir(os.path.join(STATE, found[0]))
                 status = "duplicate"
             else:
                 write("pending", record)

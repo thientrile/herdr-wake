@@ -1,9 +1,21 @@
 #!/bin/sh
-# wake shim (herdr-wake plugin): looks up the current install on every run, so plugin updates need no reinstall.
-# fallback is the plugin root at install time: enqueue must still store events while the herdr server is down.
+# wake shim (herdr-wake plugin): finds the current install on every run, so plugin updates need no reinstall.
+# It reads herdr's registry on disk, never the herdr server: the systemd worker starts through this shim at boot.
+# fallback is the plugin root at install time, for when neither the registry nor a managed checkout has wake.
 fallback=
-root=$("${HERDR_BIN_PATH:-herdr}" plugin list --json --plugin thientrile.wake 2>/dev/null |
-  python3 -c 'import json, sys; print(json.load(sys.stdin)["result"]["plugins"][0]["plugin_root"])' 2>/dev/null)
+root=$(python3 -I - 2>/dev/null <<'EOF'
+import glob, json, os
+herdr = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "herdr")
+try:
+    with open(os.path.join(herdr, "plugins.json")) as f:
+        roots = [p["plugin_root"] for p in json.load(f) if p.get("plugin_id") == "thientrile.wake"]
+except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    roots = []
+# registry unreadable or stale: the newest herdr-managed checkout
+roots += sorted(glob.glob(os.path.join(herdr, "plugins/github-installations/thientrile.wake-*/*/checkout")), key=os.path.getmtime, reverse=True)
+print(next((r for r in roots if os.path.isfile(os.path.join(r, "wake"))), ""))
+EOF
+)
 [ -f "$root/wake" ] || root=$fallback
 [ -f "$root/wake" ] || { echo "wake: plugin thientrile.wake is not installed in herdr" >&2; exit 127; }
 exec python3 -I "$root/wake" "$@"

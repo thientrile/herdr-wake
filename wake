@@ -5,16 +5,18 @@
                  [--pane-hint P] [--kind K] [--hint LINE]
     wake worker          the single long-running delivery process (global lock)
     wake status          counts per state, overdue events, last transitions
-    wake install-unit    write the systemd user unit for `wake worker` (does not enable it)
+    wake install-unit    write the systemd user unit for `wake worker` if missing or outdated (does not enable it)
 
 Producers only call `wake enqueue` (docs/enqueue-contract.md). Every state file is written
 temp -> flush -> fsync -> os.replace -> fsync(dir), so a crash leaves either the old or the
 new file, never a half one. Delivery is at-least-once: each prompt carries `wake-id <batch>`.
 """
-import collections, fcntl, hashlib, json, os, re, secrets, shlex, shutil, subprocess, sys, time
+import collections, fcntl, glob, hashlib, json, os, re, secrets, shlex, shutil, subprocess, sys, time
 
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "herdr-wake")
 CONFIG = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or os.path.expanduser("~/.config/herdr/plugins/config/thientrile.wake")
+HERDR_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "herdr")
+BIN_DIR = os.environ.get("WAKE_BIN_DIR") or os.path.expanduser("~/.local/bin")
 HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
 STATES = ("pending", "delivering", "delivered", "failed")
 POLL = 5                  # seconds between worker passes
@@ -347,6 +349,24 @@ def run_once(now=None):
     return sent
 
 
+def installed():
+    """Hash of the wake script herdr has installed now, found by the same rule as the bin/wake shim; None if none."""
+    try:
+        with open(os.path.join(HERDR_DIR, "plugins.json")) as f:
+            roots = [p["plugin_root"] for p in json.load(f) if p.get("plugin_id") == "thientrile.wake"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        roots = []
+    roots += sorted(glob.glob(os.path.join(HERDR_DIR, "plugins/github-installations/thientrile.wake-*/*/checkout")),
+                    key=os.path.getmtime, reverse=True)
+    for r in roots:
+        try:
+            with open(os.path.join(r, "wake"), "rb") as f:
+                return hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            continue
+    return None
+
+
 def worker():
     lock = open(os.path.join(STATE, "worker.lock"), "w")
     try:
@@ -355,13 +375,18 @@ def worker():
         print("wake: another worker holds the lock; exiting")
         return 0
     recover()
-    print(f"wake: worker running, state {STATE}", flush=True)
+    started = installed()
+    print(f"wake: worker running from {os.path.realpath(__file__)}, state {STATE}", flush=True)
     while True:
         try:
             run_once()
         except Exception as e:  # nothing may kill the only worker; the next pass recovers what this one left
             print(f"wake: pass failed, retrying: {e!r}", file=sys.stderr, flush=True)
         time.sleep(POLL)
+        now = installed()
+        if now and now != started:  # between passes nothing is in flight; Restart=always starts the new install
+            print("wake: plugin updated, exiting so the new version takes over", flush=True)
+            return 0
 
 
 def status():
@@ -388,7 +413,7 @@ def status():
     return 0
 
 
-def unit_text(script, herdr_bin):
+def unit_text(shim, herdr_bin):
     # pin the producers' state dir, the notify_cmd config dir and PATH: the systemd user manager has none of them
     path = [os.path.expanduser("~/.local/bin"), os.path.dirname(herdr_bin), "/usr/local/bin", "/usr/bin", "/bin"]
     env = {"HERDR_BIN_PATH": herdr_bin, "XDG_STATE_HOME": os.path.dirname(STATE), "HERDR_PLUGIN_CONFIG_DIR": CONFIG,
@@ -398,7 +423,7 @@ def unit_text(script, herdr_bin):
 Description=herdr-wake delivery worker (wakes herdr agent panes from the wake queue)
 
 [Service]
-ExecStart={shutil.which("python3") or "/usr/bin/python3"} -I {script} worker
+ExecStart={shim} worker
 {env_lines}Restart=always
 RestartSec=5
 
@@ -408,16 +433,33 @@ WantedBy=default.target
 
 
 def install_unit():
-    script = os.path.realpath(__file__)
+    # ExecStart is the shim, not this checkout: herdr moves the checkout on every plugin update
+    shim = os.path.join(BIN_DIR, "wake")
+    try:
+        with open(shim) as f:
+            ours = "herdr-wake plugin" in f.read()
+    except OSError:
+        ours = False
+    if not ours:
+        return fail(1, f"{shim} is not the herdr-wake shim; run the plugin action install-cli first")
     herdr_bin = shutil.which(HERDR)
     if not herdr_bin:
         return fail(1, f"{HERDR} not found on PATH; set HERDR_BIN_PATH")
     path = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "systemd/user/herdr-wake.service")
+    text = unit_text(shim, os.path.realpath(herdr_bin))
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                print(f"{path} is up to date")
+                return 0
+    except OSError:
+        pass
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
-        f.write(unit_text(script, os.path.realpath(herdr_bin)))
-    print(f"wrote {path} (ExecStart uses {script}; re-run `wake install-unit` after a plugin update moves it)")
+        f.write(text)
+    print(f"wrote {path} (ExecStart is the wake shim, which runs the current plugin install)")
     print("enable with: systemctl --user daemon-reload && systemctl --user enable --now herdr-wake.service")
+    print("if already enabled: systemctl --user daemon-reload && systemctl --user restart herdr-wake.service")
     return 0
 
 

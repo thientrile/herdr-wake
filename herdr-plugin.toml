@@ -1,6 +1,6 @@
 id = "thientrile.wake"
 name = "herdr-wake"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.1"
 description = "Durable wake-up queue and one delivery worker for herdr agent panes; gh-watch and hjob enqueue, the worker prompts the pane."
 platforms = ["linux"]

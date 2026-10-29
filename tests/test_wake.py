@@ -1,5 +1,5 @@
 """Tests for wake with a fake `herdr` on PATH. Run: python3 -m unittest discover -s tests"""
-import importlib.machinery, importlib.util, io, json, os, signal, subprocess, sys, tempfile, time, unittest
+import importlib.machinery, importlib.util, io, json, os, shutil, signal, subprocess, sys, tempfile, time, unittest
 from contextlib import redirect_stdout, redirect_stderr
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,7 +50,8 @@ class Base(unittest.TestCase):
             f.write(FAKE_HERDR)
         os.chmod(os.path.join(self.bindir, "herdr"), 0o755)
         self.env = dict(os.environ, PATH=self.bindir + ":" + os.environ["PATH"], FAKE_HERDR_DIR=self.fake,
-                        XDG_STATE_HOME=self.state_home, HERDR_PLUGIN_CONFIG_DIR=os.path.join(t, "config"))
+                        XDG_STATE_HOME=self.state_home, HERDR_PLUGIN_CONFIG_DIR=os.path.join(t, "config"),
+                        XDG_CONFIG_HOME=os.path.join(t, "xdgconfig"), WAKE_BIN_DIR=os.path.join(t, "lb"))
         self.env.pop("HERDR_BIN_PATH", None)
         self._old_env = dict(os.environ)
         os.environ.update(self.env)
@@ -260,8 +261,10 @@ class Delivery(Base):
         class Stop(Exception):
             pass
 
-        def sleep(_):
-            raise Stop
+        def sleep(seconds):  # subprocess also sleeps while reaping a child: only the worker's poll stops the loop
+            if seconds == self.W.POLL:
+                raise Stop
+            real_sleep(seconds)
 
         real_sleep = time.sleep
         self.W.move, time.sleep = flaky, sleep  # the module shares `time`: restore it below
@@ -545,18 +548,20 @@ class Help(Base):
 
 
 class InstallUnit(Base):
+    def install_unit(self, **env):
+        return subprocess.run([sys.executable, "-I", WAKE, "install-unit"], env=dict(self.env, **env), capture_output=True, text=True)
+
     def test_unit_text_and_install(self):
-        cfg = os.path.join(self.tmp.name, "xdgconfig")
-        r = subprocess.run([sys.executable, "-I", WAKE, "install-unit"], env=dict(self.env, XDG_CONFIG_HOME=cfg),
-                           capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        unit = open(os.path.join(cfg, "systemd/user/herdr-wake.service")).read()
-        python = subprocess.run(["sh", "-c", "command -v python3"], capture_output=True, text=True, env=self.env).stdout.strip()
+        self.assertEqual(self.install_unit().returncode, 1)  # no shim yet: the unit would point at nothing
+        self.assertEqual(subprocess.run(["sh", os.path.join(ROOT, "install-cli.sh")], env=self.env, capture_output=True).returncode, 0)
+        cfg = self.env["XDG_CONFIG_HOME"]
+        unit_path = os.path.join(cfg, "systemd/user/herdr-wake.service")
+        unit = open(unit_path).read()  # install-cli wrote it
         self.assertEqual(unit, f"""[Unit]
 Description=herdr-wake delivery worker (wakes herdr agent panes from the wake queue)
 
 [Service]
-ExecStart={python} -I {os.path.realpath(WAKE)} worker
+ExecStart={self.env["WAKE_BIN_DIR"]}/wake worker
 Environment="HERDR_BIN_PATH={os.path.realpath(os.path.join(self.bindir, "herdr"))}"
 Environment="XDG_STATE_HOME={self.state_home}"
 Environment="HERDR_PLUGIN_CONFIG_DIR={self.env["HERDR_PLUGIN_CONFIG_DIR"]}"
@@ -567,29 +572,102 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 """)
+        r = self.install_unit()
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, f"{unit_path} is up to date"), r.stderr)
+        open(unit_path, "w").write(unit.replace("RestartSec=5", "RestartSec=9"))  # outdated: rewritten
+        r = self.install_unit()
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("systemctl --user daemon-reload && systemctl --user enable --now herdr-wake.service", r.stdout)
+        self.assertEqual(open(unit_path).read(), unit)
 
     def test_install_unit_without_herdr_fails(self):
-        r = subprocess.run([sys.executable, "-I", WAKE, "install-unit"],
-                           env=dict(self.env, HERDR_BIN_PATH="no-such-herdr", XDG_CONFIG_HOME=self.tmp.name),
-                           capture_output=True, text=True)
+        subprocess.run(["sh", os.path.join(ROOT, "install-cli.sh")], env=self.env, capture_output=True)
+        r = self.install_unit(HERDR_BIN_PATH="no-such-herdr", XDG_CONFIG_HOME=self.tmp.name)
         self.assertEqual(r.returncode, 1)
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "systemd")))
 
 
 class Shim(Base):
     def test_install_cli_refuses_foreign_wake(self):
-        d = os.path.join(self.tmp.name, "lb")
-        env = dict(self.env, WAKE_BIN_DIR=d)
+        d, env = self.env["WAKE_BIN_DIR"], self.env
         self.assertEqual(subprocess.run(["sh", os.path.join(ROOT, "install-cli.sh")], env=env, capture_output=True).returncode, 0)
         self.assertIn("herdr-wake plugin", open(os.path.join(d, "wake")).read())
-        # fake herdr answers `plugin list` with nothing, as when the server is down: the install-time root is used
+        # no herdr registry and no managed checkout: the install-time root is used
         r = subprocess.run([os.path.join(d, "wake"), "enqueue", "--source", "hjob", "--id", "s1", "--cwd", "/tmp", "--text", "t"],
                            env=env, capture_output=True, text=True)
         self.assertEqual((r.returncode, json.loads(r.stdout)["status"]), (0, "enqueued"), r.stderr)
         open(os.path.join(d, "wake"), "w").write("foreign")
         self.assertEqual(subprocess.run(["sh", os.path.join(ROOT, "install-cli.sh")], env=env, capture_output=True).returncode, 1)
         self.assertEqual(open(os.path.join(d, "wake")).read(), "foreign")
+
+
+
+class PluginUpdate(Base):
+    """A fake herdr install tree: plugins.json plus github-installations/<id>-<hash>/<n>/checkout, as herdr lays them out."""
+    def setUp(self):
+        super().setUp()
+        self.herdr = os.path.join(self.env["XDG_CONFIG_HOME"], "herdr")
+        subprocess.run(["sh", os.path.join(ROOT, "install-cli.sh")], env=self.env, capture_output=True, check=True)
+        self.shim = os.path.join(self.env["WAKE_BIN_DIR"], "wake")
+
+    def checkout(self, n, script, register=True):
+        d = os.path.join(self.herdr, "plugins/github-installations/thientrile.wake-abc", f"{n}-0", "checkout")
+        os.makedirs(d)
+        with open(os.path.join(d, "wake"), "w") as f:
+            f.write(script)
+        if register:
+            with open(os.path.join(self.herdr, "plugins.json"), "w") as f:
+                json.dump([{"plugin_id": "other", "plugin_root": "/nowhere"}, {"plugin_id": "thientrile.wake", "plugin_root": d}], f)
+        return d
+
+    def run_shim(self, *args):
+        return subprocess.run([self.shim, *args], env=self.env, capture_output=True, text=True, timeout=10)
+
+    def test_shim_follows_updates_without_the_herdr_server(self):
+        with open(os.path.join(self.bindir, "herdr"), "w") as f:
+            f.write("#!/bin/sh\nsleep 60\n")  # a herdr that never answers: the shim must not ask it
+        me = 'import os, sys; print(os.path.basename(os.path.dirname(os.path.dirname(__file__))), *sys.argv[1:])'
+        a = self.checkout(1, me)
+        self.assertEqual(self.run_shim("x").stdout.strip(), "1-0 x")
+        self.checkout(2, me)  # update: new numbered dir, registry moved, old one cleaned up
+        shutil.rmtree(os.path.dirname(a))
+        self.assertEqual(self.run_shim().stdout.strip(), "2-0")
+        os.unlink(os.path.join(self.herdr, "plugins.json"))  # registry unreadable: newest managed checkout
+        old = self.checkout(3, me, register=False)
+        os.utime(old, (1, 1))
+        self.assertEqual(self.run_shim().stdout.strip(), "2-0")
+        with open(os.path.join(self.herdr, "plugins.json"), "w") as f:
+            json.dump([{"plugin_id": "thientrile.wake", "plugin_root": "/gone"}], f)  # registry points at a removed dir
+        self.assertEqual(self.run_shim().stdout.strip(), "2-0")
+        shutil.rmtree(os.path.join(self.herdr, "plugins"))  # nothing on disk: the install-time root
+        self.assertEqual(json.loads(self.run_shim("enqueue", "--source", "hjob", "--id", "s1", "--cwd", "/tmp", "--text", "t").stdout)["status"], "enqueued")
+
+    def test_worker_exits_on_update_and_restart_runs_the_new_version(self):
+        src = open(WAKE).read()
+        a = self.checkout(1, src)
+        self.enqueue("u1")
+        w = subprocess.Popen([self.shim, "worker"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            self.assertTrue(self.wait_for(lambda: self.count("delivered") == 1))
+            time.sleep(self.W.POLL + 1)
+            self.assertIsNone(w.poll(), "worker must keep running while the install is unchanged")
+            b = self.checkout(2, src + "\n# v2\n")
+            shutil.rmtree(os.path.dirname(a))
+            self.assertEqual(w.wait(timeout=3 * self.W.POLL), 0)
+        finally:
+            w.kill()
+            out = w.communicate()[0]
+        self.assertIn(f"running from {a}/wake", out)
+        self.assertIn("plugin updated", out)
+        self.enqueue("u2")
+        w = subprocess.Popen([self.shim, "worker"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:  # what Restart=always does
+            self.assertTrue(self.wait_for(lambda: self.count("delivered") == 2), self.counts())
+        finally:
+            w.terminate()
+            out = w.communicate()[0]
+        self.assertIn(f"running from {b}/wake", out)
+        self.assertEqual(self.counts(), {"pending": 0, "delivering": 0, "delivered": 2, "failed": 0})
 
 
 if __name__ == "__main__":

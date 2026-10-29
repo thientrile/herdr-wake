@@ -142,6 +142,14 @@ class Enqueue(Base):
             self.assertEqual(self.W.main(["enqueue", "--bogus", "1"]), 2)
         self.assertEqual(self.count("pending"), 0)
 
+    def test_fresh_state_dirs_are_fsynced_into_their_parents(self):
+        self.W.STATE = os.path.join(self.tmp.name, "fresh", "herdr-wake")
+        synced, real = [], self.W.fsync_dir
+        self.W.fsync_dir = lambda d: (synced.append(d), real(d))
+        self.assertEqual(self.enqueue("d1")[0], 0)
+        for d in (self.tmp.name, os.path.join(self.tmp.name, "fresh"), self.W.STATE, os.path.join(self.W.STATE, "pending")):
+            self.assertIn(d, synced)
+
     def test_text_is_sanitised_and_capped(self):
         self.enqueue("d1", text="line1\nline2\x1b[31m" + "x" * 400, hint="a\nb")
         rec = self.W.records("pending")[0]
@@ -243,9 +251,35 @@ class Delivery(Base):
                 self.W.worker()
         finally:
             time.sleep = real_sleep
-        self.assertEqual(self.counts(), {"pending": 1, "delivering": 0, "delivered": 0, "failed": 0})
+        self.assertEqual(self.counts(), {"pending": 0, "delivering": 1, "delivered": 0, "failed": 0})
+        self.run_pass(time.time())  # the next pass recovers what the failed one left
+        self.assertEqual(self.counts(), {"pending": 0, "delivering": 0, "delivered": 1, "failed": 0})
+
+    def test_failed_recovery_is_retried_on_later_passes(self):
+        self.enqueue("d1")
+        real_move, fails = self.W.move, {"delivered": 1, "pending": 2}
+
+        def flaky(src, dst, rec, **kw):
+            if fails.get(dst):
+                fails[dst] -= 1
+                raise OSError("disk full")
+            return real_move(src, dst, rec, **kw)
+
+        self.W.move = flaky
+        for _ in range(3):  # delivery fails, then recovery fails twice
+            with self.assertRaises(OSError):
+                self.run_pass(time.time())
+        self.assertEqual(self.counts()["delivering"], 1)
         self.run_pass(time.time())
-        self.assertEqual(self.counts()["delivered"], 1)
+        self.assertEqual(self.counts(), {"pending": 0, "delivering": 0, "delivered": 1, "failed": 0})
+
+    def test_large_backlog_is_split_into_bounded_prompts(self):
+        for i in range(60):
+            self.enqueue(f"d{i}", text="x" * 300, hint="y" * 200)
+        self.run_pass(time.time())
+        self.run_pass(time.time())
+        self.assertEqual([p["args"][3].count("\n- [") for p in self.prompts()], [50, 10])
+        self.assertEqual(self.counts()["delivered"], 60)
 
     def test_busy_over_600s_delivered_after_idle(self):
         t0 = time.time()
@@ -483,6 +517,7 @@ Description=herdr-wake delivery worker (wakes herdr agent panes from the wake qu
 ExecStart={python} -I {os.path.realpath(WAKE)} worker
 Environment="HERDR_BIN_PATH={os.path.realpath(os.path.join(self.bindir, "herdr"))}"
 Environment="XDG_STATE_HOME={self.state_home}"
+Environment="HERDR_PLUGIN_CONFIG_DIR={self.env["HERDR_PLUGIN_CONFIG_DIR"]}"
 Environment="PATH={os.path.expanduser("~/.local/bin")}:{self.bindir}:/usr/local/bin:/usr/bin:/bin"
 Restart=always
 RestartSec=5

@@ -22,6 +22,7 @@ BACKOFF_MAX = 600         # backoff min(30*2^n, 600)s
 OVERDUE = 3600            # pending this long -> overdue flag + one owner notify
 CWD_TTL = 86400           # target cwd missing this long after enqueue -> failed
 ERROR_CAP = 20            # herdr prompt errors (not busy) before failed
+MAX_BATCH = 50            # events per prompt: 50 x ~520 bytes stays far below Linux's 128 KiB per-argument limit
 PROMPT_TIMEOUT = 30       # seconds; herdr itself gets 20 s to see the agent start
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 RULES = {"source": r"[a-z0-9-]{1,32}", "id": r"[A-Za-z0-9._:-]{1,128}", "kind": r"[a-z0-9_.-]{1,40}",
@@ -90,8 +91,18 @@ def log(record, src, dst):
 
 
 def setup():
+    """Create the state dirs, fsyncing each new dir's parent so a fresh queue survives a crash with its first event."""
     for s in STATES:
-        os.makedirs(os.path.join(STATE, s), exist_ok=True)
+        missing, d = [], os.path.join(STATE, s)
+        while not os.path.isdir(d):
+            missing.append(d)
+            d = os.path.dirname(d)
+        for d in reversed(missing):
+            try:
+                os.mkdir(d)
+            except FileExistsError:
+                pass
+            fsync_dir(os.path.dirname(d))
 
 
 def queue_lock():
@@ -250,14 +261,16 @@ def prompt_text(batch_id, batch):
 
 
 def recover():
-    """Worker start: every delivering goes back to pending (at-least-once); copies left by a crash mid-move are dropped."""
+    """Every delivering goes back to pending (at-least-once); copies left by a crash mid-move are dropped.
+    Runs at worker start and before any pass that finds delivering/ non-empty, so a pass or recovery that died
+    on a full disk heals once the disk is back."""
     with queue_lock():
         done = {n for s in ("delivered", "failed") for n in os.listdir(os.path.join(STATE, s))}
         for rec in records("delivering"):
             if name(rec["key"]) in done:
                 os.unlink(os.path.join(STATE, "delivering", name(rec["key"])))
             else:
-                move("delivering", "pending", rec, last_error="worker restarted mid-dispatch")
+                move("delivering", "pending", rec, last_error="previous pass died mid-dispatch")
         for rec in records("pending"):
             if name(rec["key"]) in done:
                 os.unlink(os.path.join(STATE, "pending", name(rec["key"])))
@@ -266,6 +279,8 @@ def recover():
 def run_once(now=None):
     """One delivery pass. Returns the number of prompts sent."""
     now = int(now if now is not None else time.time())
+    if any(n.endswith(".json") for n in os.listdir(os.path.join(STATE, "delivering"))):
+        recover()  # between passes nothing is in flight: anything in delivering/ was left by a pass that died
     pending = records("pending")
     for rec in pending:
         if not rec["overdue_notified"] and now - rec["created_at"] >= OVERDUE:
@@ -310,7 +325,7 @@ def run_once(now=None):
                     retry(rec, now, f"agent {panes_by_id[pane_id].get('agent_status')}")
                     write("pending", rec)
             continue
-        batch.sort(key=lambda r: r["created_at"])
+        batch = sorted(batch, key=lambda r: r["created_at"])[:MAX_BATCH]  # the rest go in the next pass
         batch_id = secrets.token_hex(6)
         with queue_lock():
             for rec in batch:
@@ -341,12 +356,8 @@ def worker():
     while True:
         try:
             run_once()
-        except Exception as e:  # nothing may kill the only worker; a pass that died mid-move hands its events back
+        except Exception as e:  # nothing may kill the only worker; the next pass recovers what this one left
             print(f"wake: pass failed, retrying: {e!r}", file=sys.stderr, flush=True)
-            try:
-                recover()
-            except Exception as e:
-                print(f"wake: recover failed, retrying: {e!r}", file=sys.stderr, flush=True)
         time.sleep(POLL)
 
 
@@ -375,9 +386,10 @@ def status():
 
 
 def unit_text(script, herdr_bin):
-    # pin the producers' state dir and PATH (notify_cmd lives there): the systemd user manager has neither
+    # pin the producers' state dir, the notify_cmd config dir and PATH: the systemd user manager has none of them
     path = [os.path.expanduser("~/.local/bin"), os.path.dirname(herdr_bin), "/usr/local/bin", "/usr/bin", "/bin"]
-    env = {"HERDR_BIN_PATH": herdr_bin, "XDG_STATE_HOME": os.path.dirname(STATE), "PATH": ":".join(dict.fromkeys(path))}
+    env = {"HERDR_BIN_PATH": herdr_bin, "XDG_STATE_HOME": os.path.dirname(STATE), "HERDR_PLUGIN_CONFIG_DIR": CONFIG,
+           "PATH": ":".join(dict.fromkeys(path))}
     env_lines = "".join(f'Environment="{k}={v.replace("%", "%%")}"\n' for k, v in env.items())
     return f"""[Unit]
 Description=herdr-wake delivery worker (wakes herdr agent panes from the wake queue)

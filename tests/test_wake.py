@@ -565,6 +565,7 @@ ExecStart={self.env["WAKE_BIN_DIR"]}/wake worker
 Environment="HERDR_BIN_PATH={os.path.realpath(os.path.join(self.bindir, "herdr"))}"
 Environment="XDG_STATE_HOME={self.state_home}"
 Environment="HERDR_PLUGIN_CONFIG_DIR={self.env["HERDR_PLUGIN_CONFIG_DIR"]}"
+Environment="XDG_CONFIG_HOME={cfg}"
 Environment="PATH={os.path.expanduser("~/.local/bin")}:{self.bindir}:/usr/local/bin:/usr/bin:/bin"
 Restart=always
 RestartSec=5
@@ -668,6 +669,15 @@ class PluginUpdate(Base):
             out = w.communicate()[0]
         self.assertIn(f"running from {b}/wake", out)
         self.assertEqual(self.counts(), {"pending": 0, "delivering": 0, "delivered": 2, "failed": 0})
+
+    def test_update_landing_while_the_worker_starts_still_switches(self):
+        src = open(WAKE).read()
+        a = self.checkout(1, src)
+        self.checkout(2, src + "\n# v2\n")  # the registry already moved on when the old code was loaded
+        r = subprocess.run([sys.executable, "-I", os.path.join(a, "wake"), "worker"], env=self.env, capture_output=True,
+                           text=True, timeout=3 * self.W.POLL)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("plugin updated", r.stdout)
 
 
 if __name__ == "__main__":

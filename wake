@@ -349,6 +349,11 @@ def run_once(now=None):
     return sent
 
 
+def digest(path):
+    with open(path, "rb") as f:
+        return hashlib.sha1(f.read()).hexdigest()
+
+
 def installed():
     """Hash of the wake script herdr has installed now, found by the same rule as the bin/wake shim; None if none."""
     try:
@@ -360,14 +365,14 @@ def installed():
                     key=os.path.getmtime, reverse=True)
     for r in roots:
         try:
-            with open(os.path.join(r, "wake"), "rb") as f:
-                return hashlib.sha1(f.read()).hexdigest()
+            return digest(os.path.join(r, "wake"))
         except OSError:
             continue
     return None
 
 
 def worker():
+    running = digest(__file__)  # the code this process loaded, before an update can move the registry
     lock = open(os.path.join(STATE, "worker.lock"), "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -375,7 +380,6 @@ def worker():
         print("wake: another worker holds the lock; exiting")
         return 0
     recover()
-    started = installed()
     print(f"wake: worker running from {os.path.realpath(__file__)}, state {STATE}", flush=True)
     while True:
         try:
@@ -384,7 +388,7 @@ def worker():
             print(f"wake: pass failed, retrying: {e!r}", file=sys.stderr, flush=True)
         time.sleep(POLL)
         now = installed()
-        if now and now != started:  # between passes nothing is in flight; Restart=always starts the new install
+        if now and now != running:  # between passes nothing is in flight; Restart=always starts the installed one
             print("wake: plugin updated, exiting so the new version takes over", flush=True)
             return 0
 
@@ -414,10 +418,10 @@ def status():
 
 
 def unit_text(shim, herdr_bin):
-    # pin the producers' state dir, the notify_cmd config dir and PATH: the systemd user manager has none of them
+    # pin the producers' state dir, the notify_cmd config dir, herdr's registry dir and PATH: the systemd user manager has none of them
     path = [os.path.expanduser("~/.local/bin"), os.path.dirname(herdr_bin), "/usr/local/bin", "/usr/bin", "/bin"]
     env = {"HERDR_BIN_PATH": herdr_bin, "XDG_STATE_HOME": os.path.dirname(STATE), "HERDR_PLUGIN_CONFIG_DIR": CONFIG,
-           "PATH": ":".join(dict.fromkeys(path))}
+           "XDG_CONFIG_HOME": os.path.dirname(HERDR_DIR), "PATH": ":".join(dict.fromkeys(path))}
     env_lines = "".join(f'Environment="{k}={v.replace("%", "%%")}"\n' for k, v in env.items())
     return f"""[Unit]
 Description=herdr-wake delivery worker (wakes herdr agent panes from the wake queue)

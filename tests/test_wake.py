@@ -539,6 +539,67 @@ class Worker(Base):
             self.assertEqual(self.W.status(), 0)
 
 
+class Housekeeping(Base):
+    def age(self, state, days):
+        for n in os.listdir(os.path.join(self.W.STATE, state)):
+            t = time.time() - days * 86400
+            os.utime(os.path.join(self.W.STATE, state, n), (t, t))
+
+    def put(self, id, state, days):
+        self.enqueue(id)
+        rec = self.W.records("pending")[0]
+        self.W.move("pending", state, rec)
+        os.utime(os.path.join(self.W.STATE, state, self.W.name(rec["key"])), (time.time() - days * 86400,) * 2)
+
+    def test_retention_stays_above_the_reconcile_lookback(self):
+        self.assertGreater(self.W.RETAIN, 7 * 86400 + 3600)
+
+    def test_prunes_only_old_delivered_and_failed(self):
+        self.put("old-d", "delivered", 15)
+        self.put("old-f", "failed", 15)
+        self.put("new-d", "delivered", 13)
+        self.put("new-f", "failed", 13)
+        self.put("old-ing", "delivering", 30)
+        self.enqueue("old-p")
+        self.age("pending", 30)
+        with redirect_stdout(io.StringIO()):
+            self.W.housekeep()
+        self.assertEqual(self.counts(), {"pending": 1, "delivering": 1, "delivered": 1, "failed": 1})
+        left = {r["id"] for s in self.W.STATES for r in self.W.records(s)}
+        self.assertEqual(left, {"new-d", "new-f", "old-ing", "old-p"})
+
+    def test_pruned_id_is_accepted_again_as_new(self):
+        self.put("d1", "delivered", 15)
+        self.assertEqual(json.loads(self.enqueue("d1")[1])["status"], "duplicate")
+        with redirect_stdout(io.StringIO()):
+            self.W.housekeep()
+        self.assertEqual(json.loads(self.enqueue("d1")[1])["status"], "enqueued")
+
+    def test_rotation_keeps_status_working(self):
+        self.W.LOG_MAX = 2000  # >10 lines per file, like the real 1 MiB
+        for i in range(80):
+            self.enqueue(f"d{i}")
+            self.W.housekeep()
+        self.enqueue("d80")
+        logs = sorted(n for n in os.listdir(self.W.STATE) if n.startswith("transitions.log"))
+        self.assertEqual(logs, ["transitions.log", "transitions.log.1", "transitions.log.2", "transitions.log.3"])
+        self.assertLess(os.path.getsize(os.path.join(self.W.STATE, "transitions.log")), 2000)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.W.status(), 0)
+        self.assertIn("gh-watch:d80  None -> pending", out.getvalue())
+        self.assertEqual(out.getvalue().count(" -> pending"), 10)
+
+    def test_worker_prunes_between_passes(self):
+        self.put("old-d", "delivered", 15)
+        w = self.worker_proc()
+        try:
+            self.assertTrue(self.wait_for(lambda: self.count("delivered") == 0))
+        finally:
+            w.terminate()
+            w.wait()
+
+
 class Help(Base):
     def test_help_exits_0_and_unknown_command_exits_2(self):
         r = subprocess.run([sys.executable, "-I", WAKE, "--help"], env=self.env, capture_output=True, text=True)

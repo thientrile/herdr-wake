@@ -38,6 +38,8 @@ installed script between passes; when an update changes it, the worker exits and
   After 1 h it is flagged `overdue` and the owner is notified once (herdr notification plus the
   optional `notify_cmd` in `~/.config/herdr/plugins/config/thientrile.wake/`, as in gh-watch).
 - `failed` only when the target cwd is gone for 24 h, or after 20 herdr prompt errors.
+- Once an hour the worker deletes delivered/failed records older than 14 days (an id enqueued again
+  after that is a new event) and rotates `transitions.log` at 1 MiB, keeping 3 old files.
 - Target pane at delivery time: same cwd, else a pane under the cwd (deepest), else a worktree of the
   same repo (the event's branch first). `--pane-hint` only breaks ties.
 

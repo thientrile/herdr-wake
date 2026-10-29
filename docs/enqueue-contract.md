@@ -1,6 +1,6 @@
 # herdr-wake enqueue contract v1.1 (2026-10-29)
 
-v1.1 changes delivery only; the producer CLI, exit codes and record are unchanged from v1. Missing X-GitHub-Delivery: gh-watch answers 400 and does not enqueue (agreed).
+v1.1 changes delivery only; the producer CLI, exit codes and record are unchanged from v1. Since gh-watch v0.4.0 its ids are GitHub object keys, not X-GitHub-Delivery (see `--id`). Since herdr-wake v0.1.2 dedup ids are kept 14 days (see Retention).
 
 Producers (gh-watch, hjob) call `wake enqueue` instead of `herdr agent prompt`. They never prompt panes, never take the delivery lock, never touch the state dir directly.
 
@@ -18,7 +18,7 @@ wake enqueue --source <src> --id <event-id> --cwd <abs-path> --text <line>
 | flag | rule |
 |---|---|
 | `--source` | `[a-z0-9-]{1,32}`: `gh-watch`, `hjob` |
-| `--id` | stable event id, `[A-Za-z0-9._:-]{1,128}`. gh-watch = X-GitHub-Delivery, hjob = job id. Dedup key = `<source>:<id>` |
+| `--id` | stable event id, `[A-Za-z0-9._:-]{1,128}`. gh-watch (v0.4.0+) = object key: `review:<id>`, `comment:<id>`, `run:<id>:<attempt>`, `pr:<id>:merged` (before v0.4.0: X-GitHub-Delivery); hjob = job id. Dedup key = `<source>:<id>` |
 | `--cwd` | absolute path of the work dir the event is about (hjob: job cwd; gh-watch: repo checkout from repos.tsv). Need not exist at enqueue time |
 | `--repo` | optional `owner/name`; lets the worker match worktrees of that repo |
 | `--branch` | optional; prefer the pane whose checkout is on this branch (PR head) |
@@ -31,7 +31,7 @@ Producers keep their own safe() enum rule: only derived fields, never raw payloa
 
 ## Exit codes / stdout (one JSON line)
 - `0` `{"status":"enqueued","key":"hjob:abc"}`: record fsynced to disk (temp -> fsync -> os.replace -> fsync dir).
-- `0` `{"status":"duplicate","key":...}`: key already known in any state (pending/delivered/failed). Not an error.
+- `0` `{"status":"duplicate","key":...}`: key already known in any state (pending/delivering/delivered/failed). Not an error. Delivered/failed keys are only known for 14 days (see Retention).
 - `2` validation error (bad flag/value). Message on stderr. Do not retry.
 - `1` I/O error, nothing stored. gh-watch must answer 5xx; hjob must keep its own job record and retry later.
 
@@ -57,6 +57,11 @@ Enqueue only stores. It never delivers, never starts or signals a worker, never 
   At-least-once: the same event can arrive twice; the consumer re-checks with the hint.
 - delivered = `herdr agent prompt` exit 0. Busy/blocked/stalled/timeout/error -> stays pending with backoff min(30*2^n, 600)s; never failed for busy; overdue after 1h -> one notify to owner.
 - `wake status` prints counts per state, overdue items, last transitions.
+
+## Retention (v0.1.2)
+- The worker, at most once an hour and between passes, deletes `delivered/` and `failed/` records 14 days after they reached that state (file mtime). `pending/` and `delivering/` are never pruned.
+- After that an id is unknown: enqueueing it again returns `enqueued` and the event is delivered again. Producers must not re-send ids older than 14 days. gh-watch's reconcile looks back at most 7 days (+~1 h overlap), so it stays inside the window; retention must never drop below that.
+- `transitions.log` is rotated at 1 MiB into `transitions.log.1` .. `.3`; `wake status` reads the current and previous file.
 
 ## Producer-side changes to expect
 - gh-watch: the `[gh-watch, automated]` prefix becomes `[herdr-wake, automated]` with per-line `[gh-watch]`; its consumer skill trigger must accept both.

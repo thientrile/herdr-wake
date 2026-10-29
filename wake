@@ -5,6 +5,7 @@
                  [--pane-hint P] [--kind K] [--hint LINE]
     wake worker          the single long-running delivery process (global lock)
     wake status          counts per state, overdue events, last transitions
+                         (the worker also prunes delivered/failed ids after 14 days and rotates transitions.log)
     wake install-unit    write the systemd user unit for `wake worker` if missing or outdated (does not enable it)
 
 Producers only call `wake enqueue` (docs/enqueue-contract.md). Every state file is written
@@ -26,6 +27,9 @@ CWD_TTL = 86400           # target cwd missing this long after enqueue -> failed
 ERROR_CAP = 20            # herdr prompt errors (not busy) before failed
 MAX_BATCH = 50            # events per prompt: 50 x ~520 bytes stays far below Linux's 128 KiB per-argument limit
 PROMPT_TIMEOUT = 30       # seconds; herdr itself gets 20 s to see the agent start
+RETAIN = 14 * 86400       # delivered/failed ids kept for dedup; must stay > gh-watch's 7 d reconcile lookback + ~1 h overlap
+HOUSEKEEP = 3600          # seconds between prune/rotate runs of the worker
+LOG_MAX, LOG_KEEP = 1 << 20, 3  # transitions.log rotated at 1 MiB into .1 .. .3
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 RULES = {"source": r"[a-z0-9-]{1,32}", "id": r"[A-Za-z0-9._:-]{1,128}", "kind": r"[a-z0-9_.-]{1,40}",
          "repo": r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"}
@@ -85,7 +89,7 @@ def log(record, src, dst):
     """Best effort: the state files are the truth, a lost log line must not fail a stored event."""
     line = json.dumps({"at": int(time.time()), "key": record["key"], "from": src, "to": dst,
                        "batch": record.get("batch_id"), "error": record.get("last_error")})
-    try:  # shortcut: never rotated; rotation is on the owner-approval list in the plan
+    try:
         with open(os.path.join(STATE, "transitions.log"), "a") as f:
             f.write(line + "\n")
     except OSError:
@@ -280,6 +284,29 @@ def recover():
                 os.unlink(os.path.join(STATE, "pending", name(rec["key"])))
 
 
+def housekeep(now=None):
+    """Delete delivered/failed records older than RETAIN and rotate transitions.log. The file's mtime is when the event
+    reached that state (nothing rewrites it after). A pruned id enqueued again is accepted as a new event.
+    pending/ and delivering/ are never touched."""
+    now = now if now is not None else time.time()
+    with queue_lock():
+        for s in ("delivered", "failed"):
+            d = os.path.join(STATE, s)
+            old = [n for n in os.listdir(d) if n.endswith(".json") and now - os.stat(os.path.join(d, n)).st_mtime > RETAIN]
+            for n in old:
+                os.unlink(os.path.join(d, n))
+            if old:
+                fsync_dir(d)
+                print(f"wake: pruned {len(old)} {s} record(s) older than {RETAIN // 86400} days", flush=True)
+        path = os.path.join(STATE, "transitions.log")
+        if os.path.exists(path) and os.path.getsize(path) >= LOG_MAX:
+            for i in range(LOG_KEEP - 1, 0, -1):
+                if os.path.exists(f"{path}.{i}"):
+                    os.replace(f"{path}.{i}", f"{path}.{i + 1}")
+            os.replace(path, path + ".1")
+            fsync_dir(STATE)
+
+
 def run_once(now=None):
     """One delivery pass. Returns the number of prompts sent."""
     now = int(now if now is not None else time.time())
@@ -381,9 +408,13 @@ def worker():
         return 0
     recover()
     print(f"wake: worker running from {os.path.realpath(__file__)}, state {STATE}", flush=True)
+    last_housekeep = 0
     while True:
         try:
             run_once()
+            if time.time() - last_housekeep >= HOUSEKEEP:  # between passes, never during a dispatch
+                last_housekeep = time.time()  # set first: a failing prune is retried in an hour, not every pass
+                housekeep()
         except Exception as e:  # nothing may kill the only worker; the next pass recovers what this one left
             print(f"wake: pass failed, retrying: {e!r}", file=sys.stderr, flush=True)
         time.sleep(POLL)
@@ -401,11 +432,13 @@ def status():
     print(f"overdue     {len(overdue)}")
     for r in overdue:
         print(f"  {r['key']}  pending {int((now - r['created_at']) / 60)} min  last error: {r.get('last_error')}")
-    try:
-        with open(os.path.join(STATE, "transitions.log")) as f:
-            tail = collections.deque(f, maxlen=10)
-    except OSError:
-        tail = []
+    tail = collections.deque(maxlen=10)
+    for p in ("transitions.log.1", "transitions.log"):  # the previous file too, in case a rotation just happened
+        try:
+            with open(os.path.join(STATE, p)) as f:
+                tail.extend(f)
+        except OSError:
+            pass
     print("recent transitions:")
     for line in tail:
         try:

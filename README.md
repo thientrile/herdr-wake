@@ -10,11 +10,16 @@ Python 3 stdlib only. Linux.
 
 ## Install
 1. Install the plugin in herdr (`thientrile/herdr-wake`), then run its action
-   **herdr-wake: put the wake command on PATH** (installs `~/.local/bin/wake`).
-2. `wake install-unit` writes `~/.config/systemd/user/herdr-wake.service` for the worker and
-   prints the step that enables it:
+   **herdr-wake: put the wake command on PATH**. It installs `~/.local/bin/wake` and writes
+   `~/.config/systemd/user/herdr-wake.service` when that is missing or outdated.
+2. Enable the worker once:
    `systemctl --user daemon-reload && systemctl --user enable --now herdr-wake.service`.
-   The unit points at the installed plugin path; re-run `wake install-unit` after a plugin update.
+
+Plugin updates need no manual step. The unit runs `~/.local/bin/wake worker`; that shim finds the
+current install from herdr's registry on disk (`~/.config/herdr/plugins.json`, else the newest
+managed checkout), so it works while the herdr server is down. The running worker checks the
+installed script between passes; when an update changes it, the worker exits and systemd
+(`Restart=always`) starts the new version.
 
 ## Commands
 | command | does |
@@ -22,7 +27,7 @@ Python 3 stdlib only. Linux.
 | `wake enqueue ...` | store one event durably; exit 0 only once it is on disk (see the contract) |
 | `wake worker` | the single delivery process; a second one exits while the first holds the lock |
 | `wake status` | counts per state, overdue events, the last transitions |
-| `wake install-unit` | write the systemd user unit (does not enable it) |
+| `wake install-unit` | write the systemd user unit if missing or outdated (does not enable it) |
 
 ## How delivery behaves
 - State dir `${XDG_STATE_HOME:-~/.local/state}/herdr-wake/`: `pending/ -> delivering/ -> delivered/`,

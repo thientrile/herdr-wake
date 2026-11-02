@@ -332,6 +332,18 @@ class Delivery(Base):
         self.assertEqual(len(self.prompts()), 1)
         self.assertEqual(self.counts()["delivered"], 1)
 
+    def test_busy_agent_is_retried_every_30s_not_with_backoff(self):
+        t0 = int(time.time())
+        self.enqueue("d1")
+        self.panes([("w1:p1", self.work, "working")])
+        for dt in range(0, 3017, self.W.POLL):
+            self.run_pass(t0 + dt)
+        self.assertEqual(self.prompts(), [])
+        self.panes([("w1:p1", self.work, "idle")])
+        for dt in range(3017, 3051, self.W.POLL):
+            self.run_pass(t0 + dt)
+        self.assertEqual(self.counts()["delivered"], 1)
+
     def test_overdue_flag_and_one_notify(self):
         t0 = time.time()
         self.enqueue("d1")
@@ -389,6 +401,7 @@ class Delivery(Base):
             self.run_pass(t0 + dt)
         self.assertEqual(self.counts()["pending"], 1)
         self.assertEqual(self.W.records("pending")[0].get("errors", 0), 0)
+        self.assertEqual(self.W.records("pending")[0]["next_at"], int(t0 + 2000) + 30)
 
     def test_invariant_stored_event_never_vanishes(self):
         t0 = time.time()

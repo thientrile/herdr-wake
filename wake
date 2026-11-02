@@ -22,6 +22,7 @@ HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
 STATES = ("pending", "delivering", "delivered", "failed")
 POLL = 5                  # seconds between worker passes
 BACKOFF_MAX = 600         # backoff min(30*2^n, 600)s
+BUSY_RETRY = POLL * 6     # busy agent: look again every 30 s, so it gets the event soon after it goes idle
 OVERDUE = 3600            # pending this long -> overdue flag + one owner notify
 CWD_TTL = 86400           # target cwd missing this long after enqueue -> failed
 ERROR_CAP = 20            # herdr prompt errors (not busy) before failed
@@ -250,10 +251,10 @@ def notify(title):
             pass
 
 
-def retry(rec, now, error=None, count_error=False):
+def retry(rec, now, error=None, count_error=False, busy=False):
     """Back to (or stay in) pending with the next attempt time; failed only at the herdr error cap."""
     rec["attempts"] += 1
-    rec["next_at"] = now + backoff(rec["attempts"] - 1)
+    rec["next_at"] = now + (BUSY_RETRY if busy else backoff(rec["attempts"] - 1))
     rec["last_error"] = error
     if count_error:
         rec["errors"] = rec.get("errors", 0) + 1
@@ -353,7 +354,7 @@ def run_once(now=None):
         if panes_by_id[pane_id].get("agent_status") not in ("idle", "done"):
             with queue_lock():  # busy is never a failure: wait and look again
                 for rec in [r for r in batch if r["next_at"] <= now]:
-                    retry(rec, now, f"agent {panes_by_id[pane_id].get('agent_status')}")
+                    retry(rec, now, f"agent {panes_by_id[pane_id].get('agent_status')}", busy=True)
                     write("pending", rec)
             continue
         # due events first so each bounded batch carries one; the rest go in a later pass
@@ -370,7 +371,7 @@ def run_once(now=None):
                     move("delivering", "delivered", rec, delivered_at=now, last_error=None)
                 else:  # agent_blocked or stalled is a busy agent, not a herdr fault
                     busy = "agent_blocked" in err or "agent_prompt_stalled" in err
-                    dst = retry(rec, now, err, count_error=not busy)
+                    dst = retry(rec, now, err, count_error=not busy, busy=busy)
                     move("delivering", dst, rec, **({"failed_at": now} if dst == "failed" else {}))
         sent += int(ok)
     return sent

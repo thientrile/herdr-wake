@@ -34,7 +34,8 @@ installed script between passes; when an update changes it, the worker exits and
   or `failed/`. Every write is temp file -> fsync -> rename -> fsync(dir).
 - On start the worker moves every `delivering` event back to `pending`: a crash mid-prompt re-sends
   (at-least-once). Each prompt carries `wake-id <batch_id>`.
-- A busy or blocked agent is never a failure: the event waits with backoff `min(30*2^n, 600)s`.
+- A busy or blocked agent is never a failure: the event is retried every 30 s until the agent is idle.
+  Other delivery errors back off `min(30*2^n, 600)s`.
   After 1 h it is flagged `overdue` and the owner is notified once (herdr notification plus the
   optional `notify_cmd` in `~/.config/herdr/plugins/config/thientrile.wake/`, as in gh-watch).
 - `failed` only when the target cwd is gone for 24 h, or after 20 herdr prompt errors.

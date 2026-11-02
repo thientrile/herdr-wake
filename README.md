@@ -43,7 +43,8 @@ installed script between passes; when an update changes it, the worker exits and
 - Once an hour the worker deletes delivered/failed records older than 14 days (an id enqueued again
   after that is a new event) and rotates `transitions.log` at 1 MiB, keeping 3 old files.
 - Target pane at delivery time: same cwd, else a pane under the cwd (deepest), else a worktree of the
-  same repo, on the event's branch when it names one. `--pane-hint` only breaks ties.
+  same repo, on the event's branch when it names one (a pane only on another branch never gets it:
+  the event waits and the owner is notified once). `--pane-hint` only breaks ties.
 
 ## Tests
 `python3 -m unittest discover -s tests` (uses a fake `herdr` on PATH; no herdr server needed).

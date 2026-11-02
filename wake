@@ -25,6 +25,7 @@ BACKOFF_MAX = 600         # backoff min(30*2^n, 600)s
 BUSY_RETRY = POLL * 6     # busy agent: look again every 30 s, so it gets the event soon after it goes idle
 OVERDUE = 3600            # pending this long -> overdue flag + one owner notify
 CWD_TTL = 86400           # target cwd missing this long after enqueue -> failed
+NO_PANE_TTL = 3 * 86400   # cwd exists but no agent pane matched this long after enqueue -> failed + one owner notify
 ERROR_CAP = 20            # herdr prompt errors (not busy) before failed
 MAX_BATCH = 50            # events per prompt: 50 x ~520 bytes stays far below Linux's 128 KiB per-argument limit
 PROMPT_TIMEOUT = 30       # seconds; herdr itself gets 20 s to see the agent start
@@ -340,13 +341,17 @@ def run_once(now=None):
             continue
         if rec["next_at"] > now:
             continue
-        gone = not os.path.isdir(rec["target"]["cwd"]) and now - rec["created_at"] >= CWD_TTL
+        age, exists = now - rec["created_at"], os.path.isdir(rec["target"]["cwd"])
         with queue_lock():
-            if gone:
+            if not exists and age >= CWD_TTL:
                 move("pending", "failed", rec, failed_at=now, last_error="target cwd gone past TTL")
+            elif age >= NO_PANE_TTL:
+                move("pending", "failed", rec, failed_at=now, last_error="no agent pane matched past TTL")
             else:
                 retry(rec, now, "no agent pane matches the target")
                 write("pending", rec)
+        if exists and age >= NO_PANE_TTL:  # outside the lock: notify_cmd may take seconds
+            notify(f"herdr-wake: event failed, no agent pane for {NO_PANE_TTL // 86400} days: {rec['key']}")
     sent = 0
     for pane_id, batch in by_pane.items():
         if all(r["next_at"] > now for r in batch):

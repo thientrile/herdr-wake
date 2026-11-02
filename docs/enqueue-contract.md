@@ -55,7 +55,7 @@ Enqueue only stores. It never delivers, never starts or signals a worker, never 
   - [hjob] job abc done — check: hjob status abc
   ```
   At-least-once: the same event can arrive twice; the consumer re-checks with the hint.
-- delivered = `herdr agent prompt` exit 0. Busy/blocked/stalled/timeout/error -> stays pending with backoff min(30*2^n, 600)s; never failed for busy; overdue after 1h -> one notify to owner.
+- delivered = `herdr agent prompt` exit 0. Busy/blocked/stalled -> stays pending, retried every 30 s; timeout/error -> stays pending with backoff min(30*2^n, 600)s; never failed for busy; overdue after 1h -> one notify to owner.
 - `wake status` prints counts per state, overdue items, last transitions.
 
 ## Retention (v0.1.2)

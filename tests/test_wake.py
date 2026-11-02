@@ -452,6 +452,22 @@ class Resolution(Base):
         self.assertEqual(self.pane({"cwd": self.repo, "branch": "feat"}), "feat")
         self.assertEqual(self.pane({"cwd": self.repo, "branch": "other"}), "other")
 
+    def test_worktree_needs_the_named_branch(self):
+        self.panes([("other", self.wt_other, "idle")])
+        self.assertIsNone(self.pane({"cwd": self.wt_feat, "branch": "feat"}))
+        self.assertEqual(self.pane({"cwd": self.wt_feat}), "other")  # no branch named: any worktree pane still serves
+
+    def test_event_for_a_branch_with_no_pane_stays_pending(self):
+        t0 = time.time()
+        self.panes([("other", self.wt_other, "idle")])
+        self.enqueue("ci", cwd=self.wt_feat, branch="feat")
+        self.run_pass(t0)
+        self.assertEqual(self.prompts(), [])
+        self.assertEqual(self.counts()["pending"], 1)
+        self.panes([("other", self.wt_other, "idle"), ("feat", self.wt_feat, "idle")])
+        self.run_pass(t0 + 600)
+        self.assertEqual([p["args"][2] for p in self.prompts()], ["feat"])
+
     def test_worktree_by_repo_name_when_cwd_gone(self):
         self.git("remote", "add", "origin", "git@github.com:own/proj.git")
         self.panes([("feat", self.wt_feat, "idle"), ("other", self.wt_other, "idle")])

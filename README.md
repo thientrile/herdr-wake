@@ -37,7 +37,8 @@ installed script between passes; when an update changes it, the worker exits and
 - A busy or blocked agent is never a failure: the event waits with backoff `min(30*2^n, 600)s`.
   After 1 h it is flagged `overdue` and the owner is notified once (herdr notification plus the
   optional `notify_cmd` in `~/.config/herdr/plugins/config/thientrile.wake/`, as in gh-watch).
-- `failed` only when the target cwd is gone for 24 h, or after 20 herdr prompt errors.
+- `failed` only when the target cwd is gone for 24 h, no agent pane matched for 3 days (one owner
+  notification), or after 20 herdr prompt errors.
 - Once an hour the worker deletes delivered/failed records older than 14 days (an id enqueued again
   after that is a new event) and rotates `transitions.log` at 1 MiB, keeping 3 old files.
 - Target pane at delivery time: same cwd, else a pane under the cwd (deepest), else a worktree of the

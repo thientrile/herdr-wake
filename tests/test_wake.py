@@ -463,6 +463,18 @@ class Resolution(Base):
         self.assertEqual(self.prompts(), [])
 
 
+    def test_no_pane_for_existing_folder_fails_after_ttl_with_one_notify(self):
+        t0 = time.time()
+        self.panes([("x", self.work, "idle")])
+        self.enqueue("orphan", cwd=self.repo)
+        self.run_pass(t0 + self.W.NO_PANE_TTL - 10)
+        self.assertEqual(self.counts()["pending"], 1)
+        self.run_pass(t0 + self.W.NO_PANE_TTL + 10)
+        self.run_pass(t0 + self.W.NO_PANE_TTL + 1000)
+        self.assertEqual(self.counts(), {"pending": 0, "delivering": 0, "delivered": 0, "failed": 1})
+        self.assertEqual(len([n for n in self.notifications() if "no agent pane" in " ".join(n["args"])]), 1)
+        self.assertEqual(self.prompts(), [])
+
 class Worker(Base):
     def test_kill_mid_dispatch_resets_delivering_and_delivers(self):
         self.enqueue("d1")

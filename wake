@@ -253,10 +253,11 @@ def config_cmd(fname):
 
 
 def notices():
+    """Only a missing file is an empty queue; any other read error raises, so no write ever drops queued keys."""
     try:
         with open(os.path.join(STATE, "notices.json")) as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
 
 
@@ -277,11 +278,16 @@ def flush_notices(now):
         if not n or not n["keys"] or now - n["sent_at"] < NOTICE_EVERY:
             continue
         keys = n["keys"]
+        with queue_lock():  # the attempt is on disk before any sound: a later write error cannot make it repeat each pass
+            box = notices()
+            box[kind]["sent_at"] = now
+            dump(os.path.join(STATE, "notices.json"), box)
         more = f" (+{len(keys) - 3} more)" if len(keys) > 3 else ""
-        sent = notify(f"herdr-wake: {len(keys)} {what}: {', '.join(keys[:3])}{more}; run `wake status`")
+        if not notify(f"herdr-wake: {len(keys)} {what}: {', '.join(keys[:3])}{more}; run `wake status`"):
+            continue  # no channel took it: keys stay queued for the next attempt after NOTICE_EVERY
         with queue_lock():  # notify ran outside the lock: notify_cmd may take seconds
-            box = notices()  # no channel took it: keep the keys, try again after NOTICE_EVERY
-            box[kind] = {"keys": [k for k in box[kind]["keys"] if not sent or k not in keys], "sent_at": now}
+            box = notices()
+            box[kind]["keys"] = [k for k in box[kind]["keys"] if k not in keys]
             dump(os.path.join(STATE, "notices.json"), box)
 
 

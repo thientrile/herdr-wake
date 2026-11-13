@@ -616,6 +616,34 @@ class Notices(Base):
         self.assertEqual(len(self.titles("overdue")), 1)
         self.assertEqual(self.W.notices()["overdue"]["keys"], [])
 
+    def test_write_error_after_a_send_does_not_repeat_it_each_pass(self):
+        self.W.note("failed", "gh-watch:a")
+        dump, calls = self.W.dump, []
+        def flaky(path, obj):  # the write after the send fails, as on a full disk
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError(28, "No space left on device")
+            dump(path, obj)
+        self.W.dump = flaky
+        with self.assertRaises(OSError):
+            self.W.flush_notices(int(self.t0))
+        self.W.dump = dump
+        self.W.flush_notices(int(self.t0) + 5)  # the worker's next pass
+        self.assertEqual(len(self.titles("failed")), 1)
+
+    def test_unreadable_notices_file_never_drops_queued_keys(self):
+        self.W.note("failed", "gh-watch:a")
+        real_open = open
+        def broken(path, *a, **k):
+            if str(path).endswith("notices.json") and not a:
+                raise OSError(5, "Input/output error")
+            return real_open(path, *a, **k)
+        self.W.open = broken  # module-level name lookup goes to this before builtins
+        with self.assertRaises(OSError):
+            self.W.note("failed", "gh-watch:b")
+        del self.W.open
+        self.assertEqual(self.W.notices()["failed"]["keys"], ["gh-watch:a"])
+
     def test_notify_cmd_is_coalesced_too(self):
         os.makedirs(self.W.CONFIG)
         log = os.path.join(self.tmp.name, "notify_cmd.log")

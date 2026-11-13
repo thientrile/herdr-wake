@@ -196,8 +196,8 @@ def common_dir(path):
 
 
 def resolve(target, panes):
-    """Pane for a target: exact cwd, else a pane under cwd, else a worktree of the same repo (on the event's branch
-    when it names one). Ties: pane_hint, then deepest cwd. None when nothing matches."""
+    """Pane for a target: exact cwd, else a pane under cwd, else a worktree of the same repo; when the event names a
+    branch, only panes on that branch count. Ties: pane_hint, then deepest cwd. None when nothing matches."""
     cwd = os.path.realpath(target["cwd"])
     tiers = ([], [], [])
     repo_dir = common_dir(cwd)
@@ -206,14 +206,16 @@ def resolve(target, panes):
         if not p.get("agent") or not p.get("pane_id") or not pc:
             continue
         pc = os.path.realpath(pc)
+        # every tier needs the event's branch: a pane on another branch, even in the exact cwd, does not own the work
+        if target.get("branch") and git(pc, "branch", "--show-current") != target["branch"]:
+            continue
         if pc == cwd:
             tiers[0].append((pc, p))
         elif pc.startswith(cwd + "/"):
             tiers[1].append((pc, p))
         elif os.path.isdir(pc) and (repo_dir and common_dir(pc) == repo_dir or
-                                    target.get("repo") and same_remote(pc, target["repo"])) and \
-                (not target.get("branch") or git(pc, "branch", "--show-current") == target["branch"]):
-            tiers[2].append((pc, p))  # a pane on another branch would get an event about work it does not own
+                                    target.get("repo") and same_remote(pc, target["repo"])):
+            tiers[2].append((pc, p))
     for tier in tiers:
         if tier:
             def rank(item):

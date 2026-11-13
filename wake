@@ -26,6 +26,9 @@ BUSY_RETRY = POLL * 6     # busy agent: look again every 30 s, so it gets the ev
 OVERDUE = 3600            # pending this long -> overdue flag + one owner notify
 CWD_TTL = 86400           # target cwd missing this long after enqueue -> failed
 NO_PANE_TTL = 3 * 86400   # cwd exists but no agent pane matched this long after enqueue -> failed + one owner notify
+NOTICE_EVERY = 3600       # owner notices are coalesced: at most one summary per kind per hour
+NOTICES = {"failed": f"event(s) failed, no agent pane for {NO_PANE_TTL // 86400} days",
+           "overdue": "event(s) overdue >1h, still pending", "held": "event(s) held, agent pane only on another branch"}
 ERROR_CAP = 20            # herdr prompt errors (not busy) before failed
 MAX_BATCH = 50            # events per prompt: 50 x ~520 bytes stays far below Linux's 128 KiB per-argument limit
 PROMPT_TIMEOUT = 30       # seconds; herdr itself gets 20 s to see the agent start
@@ -49,16 +52,20 @@ def fsync_dir(path):
         os.close(fd)
 
 
-def write(state, record):
-    """Durably write record into state/ (temp in the same dir, so os.replace never crosses a filesystem)."""
-    d = os.path.join(STATE, state)
+def dump(path, obj):
+    """Durably write obj to path (temp in the same dir, so os.replace never crosses a filesystem)."""
+    d = os.path.dirname(path)
     tmp = os.path.join(d, f".tmp-{os.getpid()}-{secrets.token_hex(4)}")
     with open(tmp, "w") as f:
-        json.dump(record, f)
+        json.dump(obj, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, os.path.join(d, name(record["key"])))
+    os.replace(tmp, path)
     fsync_dir(d)
+
+
+def write(state, record):
+    dump(os.path.join(STATE, state, name(record["key"])), record)
 
 
 def move(src, dst, record, **changes):
@@ -197,9 +204,9 @@ def common_dir(path):
 
 def resolve(target, panes):
     """Pane for a target: exact cwd, else a pane under cwd, else a worktree of the same repo; when the event names a
-    branch, only panes on that branch count. Ties: pane_hint, then deepest cwd. None when nothing matches."""
+    branch, only panes on that branch count; last, the pane_hint pane when its cwd contains cwd. Ties: pane_hint, then deepest cwd. None when nothing matches."""
     cwd = os.path.realpath(target["cwd"])
-    tiers = ([], [], [])
+    tiers = ([], [], [], [])
     repo_dir = common_dir(cwd)
     for p in panes:
         pc = p.get("foreground_cwd") or p.get("cwd") or ""
@@ -216,6 +223,8 @@ def resolve(target, panes):
         elif os.path.isdir(pc) and (repo_dir and common_dir(pc) == repo_dir or
                                     target.get("repo") and same_remote(pc, target["repo"])):
             tiers[2].append((pc, p))
+        elif p["pane_id"] == target.get("pane_hint") and cwd.startswith(pc.rstrip("/") + "/"):
+            tiers[3].append((pc, p))  # the pane that enqueued it, from a parent dir (agent cd'd into a sub-repo)
     for tier in tiers:
         if tier:
             def rank(item):
@@ -243,15 +252,50 @@ def config_cmd(fname):
     return shlex.split(lines[0]) if lines else []
 
 
+def notices():
+    try:
+        with open(os.path.join(STATE, "notices.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def note(kind, label):
+    """Queue an owner notice durably; the caller holds queue_lock and persists the event's own notified flag after this,
+    so a crash in between re-queues (deduped) rather than drops it."""
+    box = notices()
+    n = box.setdefault(kind, {"keys": [], "sent_at": 0})
+    if label not in n["keys"]:
+        n["keys"].append(label)
+        dump(os.path.join(STATE, "notices.json"), box)
+
+
+def flush_notices(now):
+    """One summary per kind with queued keys, at most every NOTICE_EVERY s; keys stay queued until their summary is sent."""
+    for kind, what in NOTICES.items():
+        n = notices().get(kind)
+        if not n or not n["keys"] or now - n["sent_at"] < NOTICE_EVERY:
+            continue
+        keys = n["keys"]
+        more = f" (+{len(keys) - 3} more)" if len(keys) > 3 else ""
+        sent = notify(f"herdr-wake: {len(keys)} {what}: {', '.join(keys[:3])}{more}; run `wake status`")
+        with queue_lock():  # notify ran outside the lock: notify_cmd may take seconds
+            box = notices()  # no channel took it: keep the keys, try again after NOTICE_EVERY
+            box[kind] = {"keys": [k for k in box[kind]["keys"] if not sent or k not in keys], "sent_at": now}
+            dump(os.path.join(STATE, "notices.json"), box)
+
+
 def notify(title):
-    """Same channels gh-watch and hjob use: a herdr notification, plus the optional notify_cmd (e.g. tg-notify)."""
-    herdr("notification", "show", title, "--sound", "request")
+    """Same channels gh-watch and hjob use: a herdr notification, plus the optional notify_cmd (e.g. tg-notify).
+    True when at least one channel accepted it."""
+    ok = herdr("notification", "show", title, "--sound", "request")[0]
     cmd = config_cmd("notify_cmd")
     if cmd:
         try:
-            subprocess.run([*cmd, title], capture_output=True, timeout=15)
+            ok = subprocess.run([*cmd, title], capture_output=True, timeout=15).returncode == 0 or ok
         except (OSError, subprocess.SubprocessError):
             pass
+    return ok
 
 
 def retry(rec, now, error=None, count_error=False, busy=False):
@@ -312,17 +356,23 @@ def housekeep(now=None):
 
 
 def run_once(now=None):
-    """One delivery pass. Returns the number of prompts sent."""
+    """One delivery pass, then the coalesced owner notices. Returns the number of prompts sent."""
     now = int(now if now is not None else time.time())
+    sent = deliver(now)
+    flush_notices(now)
+    return sent
+
+
+def deliver(now):
     if any(n.endswith(".json") for n in os.listdir(os.path.join(STATE, "delivering"))):
         recover()  # between passes nothing is in flight: anything in delivering/ was left by a pass that died
     pending = records("pending")
     for rec in pending:
         if not rec["overdue_notified"] and now - rec["created_at"] >= OVERDUE:
             with queue_lock():
-                write("pending", dict(rec, overdue=True, overdue_notified=True))  # flag first: one notify even across a crash
+                note("overdue", rec["key"])
+                write("pending", dict(rec, overdue=True, overdue_notified=True))
             rec.update(overdue=True, overdue_notified=True)
-            notify(f"herdr-wake: event overdue >1h, still pending: {rec['key']}")
     due = [r for r in pending if r["next_at"] <= now]
     if not due:
         return 0
@@ -347,20 +397,18 @@ def run_once(now=None):
         # a worktree pane exists but on another branch: hold the event, tell the owner once why
         miss = (rec["target"].get("branch") and not rec.get("branch_miss_notified")
                 and resolve(dict(rec["target"], branch=""), panes))
-        if miss:
-            rec["branch_miss_notified"] = True  # persisted by the write below, before the notify: one notify even across a crash
         with queue_lock():
+            if miss:
+                note("held", f"{rec['key']} (branch {rec['target']['branch']})")
+                rec["branch_miss_notified"] = True  # persisted by the write/move below
             if not exists and age >= CWD_TTL:
                 move("pending", "failed", rec, failed_at=now, last_error="target cwd gone past TTL")
-            elif age >= NO_PANE_TTL:
+            elif age >= NO_PANE_TTL:  # cwd exists here: CWD_TTL < NO_PANE_TTL
+                note("failed", rec["key"])
                 move("pending", "failed", rec, failed_at=now, last_error="no agent pane matched past TTL")
             else:
                 retry(rec, now, "no agent pane matches the target")
                 write("pending", rec)
-        if miss:
-            notify(f"herdr-wake: no agent pane on branch {rec['target']['branch']}, event held: {rec['key']}")
-        if exists and age >= NO_PANE_TTL:  # outside the lock: notify_cmd may take seconds
-            notify(f"herdr-wake: event failed, no agent pane for {NO_PANE_TTL // 86400} days: {rec['key']}")
     sent = 0
     for pane_id, batch in by_pane.items():
         if all(r["next_at"] > now for r in batch):

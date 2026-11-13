@@ -504,6 +504,18 @@ class Resolution(Base):
         self.assertEqual(self.counts()["pending"], 1)
         self.assertEqual(len([n for n in self.notifications() if "branch feat" in " ".join(n["args"])]), 1)
 
+    def test_hinted_pane_in_a_parent_dir_gets_the_event(self):
+        sub = os.path.join(self.work, "zues")  # the agent cd'd into a sub-repo before `hjob --`
+        os.makedirs(sub)
+        self.panes([("launcher", self.work, "idle"), ("other", self.wt_other, "idle")])
+        self.assertEqual(self.pane({"cwd": sub, "pane_hint": "launcher"}), "launcher")
+        self.assertIsNone(self.pane({"cwd": sub}))  # a parent-dir pane without the hint is not the owner
+        self.assertIsNone(self.pane({"cwd": sub, "pane_hint": "other"}))  # the hint alone, from an unrelated dir, is not enough
+        self.assertIsNone(self.pane({"cwd": sub, "pane_hint": "launcher", "branch": "feat"}))  # branch still binds
+        self.enqueue("job", cwd=sub, source="hjob", pane_hint="launcher")
+        self.run_pass(time.time())
+        self.assertEqual([p["args"][2] for p in self.prompts()], ["launcher"])
+
     def test_worktree_by_repo_name_when_cwd_gone(self):
         self.git("remote", "add", "origin", "git@github.com:own/proj.git")
         self.panes([("feat", self.wt_feat, "idle"), ("other", self.wt_other, "idle")])
@@ -539,6 +551,116 @@ class Resolution(Base):
         self.assertEqual(self.counts(), {"pending": 0, "delivering": 0, "delivered": 0, "failed": 1})
         self.assertEqual(len([n for n in self.notifications() if "no agent pane" in " ".join(n["args"])]), 1)
         self.assertEqual(self.prompts(), [])
+
+class Notices(Base):
+    def setUp(self):
+        super().setUp()
+        self.orphan = os.path.join(self.tmp.name, "orphan")  # exists, but no agent pane there
+        os.makedirs(self.orphan)
+        self.t0 = time.time()
+
+    def titles(self, word):
+        return [n["args"][2] for n in self.notifications() if word in n["args"][2]]
+
+    def restart(self):
+        self.W = importlib.util.module_from_spec(_spec)
+        _loader.exec_module(self.W)
+
+    def test_many_failures_in_one_pass_send_one_notice_per_kind(self):
+        for i in range(5):
+            self.enqueue(f"o{i}", cwd=self.orphan)
+        self.run_pass(self.t0 + self.W.NO_PANE_TTL + 10)
+        self.assertEqual(self.counts()["failed"], 5)
+        self.assertEqual(len(self.notifications()), 2)  # one overdue + one failed summary, not ten
+        failed, overdue = self.titles("failed"), self.titles("overdue")
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(len(overdue), 1)
+        for t in failed + overdue:
+            self.assertIn("5 event(s)", t)
+            self.assertIn("(+2 more)", t)
+            self.assertIn("wake status", t)
+
+    def test_rate_limit_holds_new_keys_until_the_hour_is_up_and_drops_none(self):
+        self.enqueue("a", cwd=self.orphan)
+        self.run_pass(self.t0 + 4000)
+        self.enqueue("b", cwd=self.orphan)
+        self.run_pass(self.t0 + 4000 + 600)  # b overdue (created ~t0) but the overdue notice went out 10 min ago
+        self.assertEqual(len(self.titles("overdue")), 1)
+        self.restart()  # the queued key and the send time survive a restart
+        self.run_pass(self.t0 + 4000 + self.W.NOTICE_EVERY)
+        overdue = self.titles("overdue")
+        self.assertEqual(len(overdue), 2)
+        self.assertIn("1 event(s)", overdue[1])
+        self.assertIn("gh-watch:b", overdue[1])
+
+    def test_restart_does_not_renotify(self):
+        for i in range(3):
+            self.enqueue(f"o{i}", cwd=self.orphan)
+        self.run_pass(self.t0 + 4000)
+        self.run_pass(self.t0 + self.W.NO_PANE_TTL + 10)
+        self.assertEqual(len(self.notifications()), 2)
+        self.restart()
+        for dt in (20, 7200, 86400):
+            self.run_pass(self.t0 + self.W.NO_PANE_TTL + dt)
+        self.assertEqual(len(self.notifications()), 2)
+
+    def test_keys_stay_queued_when_no_channel_takes_the_notice(self):
+        herdr, self.W.HERDR = self.W.HERDR, os.path.join(self.bindir, "missing")  # no notify_cmd either: nothing takes it
+        self.W.note("overdue", "gh-watch:a")
+        self.W.flush_notices(int(self.t0))
+        self.assertEqual(self.W.notices()["overdue"]["keys"], ["gh-watch:a"])
+        self.W.HERDR = herdr
+        self.W.flush_notices(int(self.t0) + 10)  # rate limit still applies to the failed attempt
+        self.assertEqual(self.notifications(), [])
+        self.W.flush_notices(int(self.t0) + self.W.NOTICE_EVERY)
+        self.assertEqual(len(self.titles("overdue")), 1)
+        self.assertEqual(self.W.notices()["overdue"]["keys"], [])
+
+    def test_write_error_after_a_send_does_not_repeat_it_each_pass(self):
+        self.W.note("failed", "gh-watch:a")
+        dump, calls = self.W.dump, []
+        def flaky(path, obj):  # the write after the send fails, as on a full disk
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError(28, "No space left on device")
+            dump(path, obj)
+        self.W.dump = flaky
+        with self.assertRaises(OSError):
+            self.W.flush_notices(int(self.t0))
+        self.W.dump = dump
+        self.W.flush_notices(int(self.t0) + 5)  # the worker's next pass
+        self.assertEqual(len(self.titles("failed")), 1)
+
+    def test_unreadable_notices_file_never_drops_queued_keys(self):
+        self.W.note("failed", "gh-watch:a")
+        real_open = open
+        def broken(path, *a, **k):
+            if str(path).endswith("notices.json") and not a:
+                raise OSError(5, "Input/output error")
+            return real_open(path, *a, **k)
+        self.W.open = broken  # module-level name lookup goes to this before builtins
+        with self.assertRaises(OSError):
+            self.W.note("failed", "gh-watch:b")
+        del self.W.open
+        self.assertEqual(self.W.notices()["failed"]["keys"], ["gh-watch:a"])
+
+    def test_notify_cmd_is_coalesced_too(self):
+        os.makedirs(self.W.CONFIG)
+        log = os.path.join(self.tmp.name, "notify_cmd.log")
+        script = os.path.join(self.bindir, "tg")
+        with open(script, "w") as f:
+            f.write(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> {log}\n")
+        os.chmod(script, 0o755)
+        with open(os.path.join(self.W.CONFIG, "notify_cmd"), "w") as f:
+            f.write(script + "\n")
+        for i in range(4):
+            self.enqueue(f"o{i}", cwd=self.orphan)
+        self.run_pass(self.t0 + self.W.NO_PANE_TTL + 10)
+        with open(log) as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("4 event(s)" in l for l in lines))
+
 
 class Worker(Base):
     def test_kill_mid_dispatch_resets_delivering_and_delivers(self):

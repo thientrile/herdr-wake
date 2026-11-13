@@ -38,14 +38,17 @@ installed script between passes; when an update changes it, the worker exits and
   Other delivery errors back off `min(30*2^n, 600)s`.
   After 1 h it is flagged `overdue` and the owner is notified once (herdr notification plus the
   optional `notify_cmd` in `~/.config/herdr/plugins/config/thientrile.wake/`, as in gh-watch).
+  Owner notices are coalesced: at most one summary per kind (overdue / failed / held) per hour, with
+  the count and the first keys; every such event is in a summary at least once, and a restart does not repeat one.
 - `failed` only when the target cwd is gone for 24 h, no agent pane matched for 3 days (one owner
   notification), or after 20 herdr prompt errors.
 - Once an hour the worker deletes delivered/failed records older than 14 days (an id enqueued again
   after that is a new event) and rotates `transitions.log` at 1 MiB, keeping 3 old files.
 - Target pane at delivery time: same cwd, else a pane under the cwd (deepest), else a worktree of the
-  same repo. When the event names a branch, only panes on that branch count in every tier, so a
+  same repo, else the `--pane-hint` pane when its cwd contains the event's cwd (an agent that `cd`'d
+  into a sub-repo before `hjob --`). When the event names a branch, only panes on that branch count in every tier, so a
   worktree on the branch beats the main checkout on `main` (a pane only on another branch never gets
-  it: the event waits and the owner is notified once). `--pane-hint` only breaks ties.
+  it: the event waits and the owner is notified once). Otherwise `--pane-hint` breaks ties.
 
 ## Tests
 `python3 -m unittest discover -s tests` (uses a fake `herdr` on PATH; no herdr server needed).

@@ -481,6 +481,29 @@ class Resolution(Base):
         self.assertIn("feat", " ".join(miss[0]["args"]))
         self.assertIn("gh-watch:ci", " ".join(miss[0]["args"]))
 
+    def test_main_checkout_pane_on_another_branch_loses_to_the_branch_worktree(self):
+        self.panes([("main", self.repo, "idle"), ("sub", os.path.join(self.repo, "a"), "idle"), ("feat", self.wt_feat, "idle")])
+        self.assertEqual(self.pane({"cwd": self.repo, "branch": "feat"}), "feat")
+
+    def test_exact_cwd_pane_on_the_event_branch_still_wins(self):
+        self.panes([("main", self.repo, "idle"), ("feat", self.wt_feat, "idle")])
+        self.assertEqual(self.pane({"cwd": self.repo, "branch": "main"}), "main")
+        self.assertEqual(self.pane({"cwd": self.wt_feat, "branch": "feat"}), "feat")
+
+    def test_no_branch_keeps_exact_cwd_first(self):
+        self.panes([("main", self.repo, "idle"), ("feat", self.wt_feat, "idle")])
+        self.assertEqual(self.pane({"cwd": self.repo}), "main")
+
+    def test_main_checkout_pane_on_another_branch_holds_and_notifies_once(self):
+        t0 = time.time()
+        self.panes([("main", self.repo, "idle")])
+        self.enqueue("ci", cwd=self.repo, branch="feat")
+        for dt in (0, 600, 1200):
+            self.run_pass(t0 + dt)
+        self.assertEqual(self.prompts(), [])
+        self.assertEqual(self.counts()["pending"], 1)
+        self.assertEqual(len([n for n in self.notifications() if "branch feat" in " ".join(n["args"])]), 1)
+
     def test_worktree_by_repo_name_when_cwd_gone(self):
         self.git("remote", "add", "origin", "git@github.com:own/proj.git")
         self.panes([("feat", self.wt_feat, "idle"), ("other", self.wt_other, "idle")])
